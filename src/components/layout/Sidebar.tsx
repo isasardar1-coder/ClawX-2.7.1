@@ -19,11 +19,16 @@ import {
   Trash2,
   Cpu,
   Moon,
+  ChevronDown,
+  ChevronRight,
+  Folder,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { rendererExtensionRegistry } from '@/extensions/registry';
 import { useSettingsStore } from '@/stores/settings';
 import { useChatStore } from '@/stores/chat';
+import { useChatFoldersStore, type ChatFolder } from '@/stores/chatFolders';
 import { useGatewayStore } from '@/stores/gateway';
 import { useAgentsStore } from '@/stores/agents';
 import { getSessionActivityMs, getSessionBucket, type SessionBucketKey } from './session-buckets';
@@ -105,6 +110,14 @@ export function Sidebar() {
   const loadSessions = useChatStore((s) => s.loadSessions);
   const loadHistory = useChatStore((s) => s.loadHistory);
 
+  const folders = useChatFoldersStore((s) => s.folders);
+  const sessionFolderIds = useChatFoldersStore((s) => s.sessionFolderIds);
+  const addFolder = useChatFoldersStore((s) => s.addFolder);
+  const renameFolder = useChatFoldersStore((s) => s.renameFolder);
+  const deleteFolder = useChatFoldersStore((s) => s.deleteFolder);
+  const moveSessionToFolder = useChatFoldersStore((s) => s.moveSessionToFolder);
+  const clearSessionFolder = useChatFoldersStore((s) => s.clearSessionFolder);
+
   const gatewayStatus = useGatewayStore((s) => s.status);
   const isGatewayRunning = gatewayStatus.state === 'running';
   const isGatewayReady = isGatewayRunning && gatewayStatus.gatewayReady !== false;
@@ -156,6 +169,13 @@ export function Sidebar() {
 
   const { t } = useTranslation(['common', 'chat']);
   const [sessionToDelete, setSessionToDelete] = useState<{ key: string; label: string } | null>(null);
+  const [folderToDelete, setFolderToDelete] = useState<ChatFolder | null>(null);
+  const [folderToRename, setFolderToRename] = useState<string | null>(null);
+  const [folderRenameValue, setFolderRenameValue] = useState('');
+  const [isAddingFolder, setIsAddingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [foldersExpanded, setFoldersExpanded] = useState<Record<string, boolean>>({});
+  const [uncategorizedExpanded, setUncategorizedExpanded] = useState(true);
   const [nowMs, setNowMs] = useState(INITIAL_NOW_MS);
 
   useEffect(() => {
@@ -173,6 +193,31 @@ export function Sidebar() {
     () => Object.fromEntries((agents ?? []).map((agent) => [agent.id, agent.name])),
     [agents],
   );
+
+  const folderIds = useMemo(() => new Set(folders.map((folder) => folder.id)), [folders]);
+  const sortedSessions = useMemo(
+    () => sessions
+      .map((session) => ({
+        session,
+        activityMs: getSessionActivityMs(session, sessionLastActivity),
+      }))
+      .sort((a, b) => b.activityMs - a.activityMs),
+    [sessionLastActivity, sessions],
+  );
+  const sessionsByFolder = useMemo(() => {
+    const grouped: Record<string, typeof sessions> = {};
+    for (const folder of folders) {
+      grouped[folder.id] = [];
+    }
+
+    for (const { session } of sortedSessions) {
+      const folderId = sessionFolderIds[session.key];
+      if (folderId && folderIds.has(folderId)) {
+        grouped[folderId].push(session);
+      }
+    }
+    return grouped;
+  }, [folderIds, folders, sessionFolderIds, sortedSessions]);
   const sessionBuckets: Array<{ key: SessionBucketKey; label: string; sessions: typeof sessions }> = [
     { key: 'today', label: t('chat:historyBuckets.today'), sessions: [] },
     { key: 'yesterday', label: t('chat:historyBuckets.yesterday'), sessions: [] },
@@ -186,15 +231,42 @@ export function Sidebar() {
     (typeof sessionBuckets)[number]
   >;
 
-  for (const { session, activityMs } of sessions
-    .map((session) => ({
-      session,
-      activityMs: getSessionActivityMs(session, sessionLastActivity),
-    }))
-    .sort((a, b) => b.activityMs - a.activityMs)) {
+  for (const { session, activityMs } of sortedSessions) {
+    const folderId = sessionFolderIds[session.key];
+    if (folderId && folderIds.has(folderId)) {
+      continue;
+    }
     const bucketKey = getSessionBucket(activityMs, nowMs);
     sessionBucketMap[bucketKey].sessions.push(session);
   }
+
+  const submitNewFolder = () => {
+    const folderId = addFolder(newFolderName);
+    if (folderId) {
+      setFoldersExpanded((state) => ({ ...state, [folderId]: true }));
+    }
+    setNewFolderName('');
+    setIsAddingFolder(false);
+  };
+
+  const startFolderRename = (folder: ChatFolder) => {
+    setFolderToRename(folder.id);
+    setFolderRenameValue(folder.name);
+  };
+
+  const submitFolderRename = (folderId: string) => {
+    renameFolder(folderId, folderRenameValue);
+    setFolderToRename(null);
+    setFolderRenameValue('');
+  };
+
+  const handleSessionDrop = (event: React.DragEvent, folderId: string | null) => {
+    event.preventDefault();
+    const sessionKey = event.dataTransfer.getData('text/plain');
+    if (sessionKey) {
+      moveSessionToFolder(sessionKey, folderId);
+    }
+  };
 
   const hiddenRoutes = rendererExtensionRegistry.getHiddenRoutes();
   const extraNavItems = rendererExtensionRegistry.getExtraNavItems();
@@ -219,6 +291,146 @@ export function Sidebar() {
       testId: item.testId,
     })),
   ];
+
+  const renderSession = (s: typeof sessions[number]) => {
+    const agentId = getAgentIdFromSessionKey(s.key);
+    const agentName = agentNameById[agentId] || agentId;
+    const isCurrent = isOnChat && currentSessionKey === s.key;
+
+    return (
+      <div
+        key={s.key}
+        className="group relative flex items-center"
+        draggable
+        onDragStart={(e) => {
+          e.dataTransfer.setData('text/plain', s.key);
+          e.dataTransfer.effectAllowed = 'move';
+        }}
+      >
+        <button
+          onClick={() => { switchSession(s.key); navigate('/'); }}
+          className={cn(
+            'w-full text-left rounded-lg px-2.5 py-1.5 text-meta transition-colors pr-7',
+            'hover:bg-black/5 dark:hover:bg-white/5',
+            isCurrent
+              ? 'bg-black/5 dark:bg-white/10 text-foreground font-medium'
+              : 'text-foreground/75',
+          )}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="shrink-0 rounded-full bg-black/[0.04] px-2 py-0.5 text-2xs font-medium text-foreground/70 dark:bg-white/[0.08]">
+              {agentName}
+            </span>
+            <span className="truncate">{getSessionLabel(s.key, s.displayName, s.label)}</span>
+          </div>
+        </button>
+        <button
+          aria-label="Delete session"
+          onClick={(e) => {
+            e.stopPropagation();
+            setSessionToDelete({
+              key: s.key,
+              label: getSessionLabel(s.key, s.displayName, s.label),
+            });
+          }}
+          className={cn(
+            'absolute right-1 flex items-center justify-center rounded p-0.5 transition-opacity',
+            'opacity-0 group-hover:opacity-100',
+            'text-muted-foreground hover:text-destructive hover:bg-destructive/10',
+          )}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    );
+  };
+
+  const renderFolder = (folder: ChatFolder) => {
+    const folderSessions = sessionsByFolder[folder.id] ?? [];
+    const isExpanded = foldersExpanded[folder.id] ?? true;
+    const isRenaming = folderToRename === folder.id;
+
+    return (
+      <div
+        key={folder.id}
+        className="pt-2"
+        data-testid={`chat-folder-${folder.id}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+        }}
+        onDrop={(e) => handleSessionDrop(e, folder.id)}
+      >
+        <div className="group flex items-center gap-1 rounded-lg px-1.5 py-1 text-muted-foreground hover:bg-black/5 dark:hover:bg-white/5">
+          <button
+            aria-label={isExpanded ? `Collapse folder ${folder.name}` : `Expand folder ${folder.name}`}
+            className="rounded p-0.5 hover:text-foreground"
+            onClick={() => setFoldersExpanded((state) => ({ ...state, [folder.id]: !isExpanded }))}
+          >
+            {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+          </button>
+          <Folder className="h-3.5 w-3.5 shrink-0" />
+          {isRenaming ? (
+            <input
+              autoFocus
+              className="min-w-0 flex-1 rounded border bg-background px-1.5 py-0.5 text-meta text-foreground"
+              value={folderRenameValue}
+              onChange={(e) => setFolderRenameValue(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  submitFolderRename(folder.id);
+                } else if (e.key === 'Escape') {
+                  setFolderToRename(null);
+                  setFolderRenameValue('');
+                }
+              }}
+              onBlur={() => submitFolderRename(folder.id)}
+            />
+          ) : (
+            <button
+              className="min-w-0 flex-1 truncate text-left text-meta font-medium text-foreground/75"
+              onClick={() => setFoldersExpanded((state) => ({ ...state, [folder.id]: !isExpanded }))}
+            >
+              {folder.name}
+            </button>
+          )}
+          <span className="shrink-0 text-2xs text-muted-foreground/60">{folderSessions.length}</span>
+          <button
+            aria-label={`Rename folder ${folder.name}`}
+            className="rounded p-0.5 opacity-0 transition-opacity hover:bg-black/10 hover:text-foreground group-hover:opacity-100 dark:hover:bg-white/10"
+            onClick={(e) => {
+              e.stopPropagation();
+              startFolderRename(folder);
+            }}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
+          <button
+            aria-label={`Delete folder ${folder.name}`}
+            className="rounded p-0.5 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+            onClick={(e) => {
+              e.stopPropagation();
+              setFolderToDelete(folder);
+            }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        {isExpanded && (
+          <div className="mt-0.5 space-y-0.5 pl-5">
+            {folderSessions.length > 0 ? (
+              folderSessions.map(renderSession)
+            ) : (
+              <div className="rounded-lg border border-dashed border-border/70 px-2 py-2 text-2xs text-muted-foreground/70">
+                Drop chats here
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <aside
@@ -283,59 +495,75 @@ export function Sidebar() {
       </nav>
 
       {/* Session list — below Settings, only when expanded */}
-      {!sidebarCollapsed && sessions.length > 0 && (
-        <div className="mt-4 flex-1 overflow-y-auto overflow-x-hidden px-2 pb-2 space-y-0.5">
-          {sessionBuckets.map((bucket) => (
-            bucket.sessions.length > 0 ? (
-              <div key={bucket.key} data-testid={`session-bucket-${bucket.key}`} className="pt-2">
-                <div className="px-2.5 pb-1 text-tiny font-medium text-muted-foreground/60 tracking-tight">
-                  {bucket.label}
+      {!sidebarCollapsed && (
+        <div className="mt-4 flex-1 overflow-y-auto overflow-x-hidden px-2 pb-2 space-y-1">
+          <div className="flex items-center justify-between px-2.5 pb-1 text-tiny font-medium text-muted-foreground/60 tracking-tight">
+            <span>Folders</span>
+            <button
+              aria-label="Create folder"
+              className="rounded p-0.5 text-muted-foreground hover:bg-black/10 hover:text-foreground dark:hover:bg-white/10"
+              onClick={() => setIsAddingFolder(true)}
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          {isAddingFolder && (
+            <div className="px-2 pb-1">
+              <input
+                autoFocus
+                className="w-full rounded border bg-background px-2 py-1 text-meta text-foreground"
+                placeholder="Folder name"
+                value={newFolderName}
+                onChange={(e) => setNewFolderName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    submitNewFolder();
+                  } else if (e.key === 'Escape') {
+                    setNewFolderName('');
+                    setIsAddingFolder(false);
+                  }
+                }}
+                onBlur={() => {
+                  if (newFolderName.trim()) {
+                    submitNewFolder();
+                  } else {
+                    setIsAddingFolder(false);
+                  }
+                }}
+              />
+            </div>
+          )}
+
+          {folders.map(renderFolder)}
+
+          <div
+            className="pt-2"
+            data-testid="chat-folder-unfiled"
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'move';
+            }}
+            onDrop={(e) => handleSessionDrop(e, null)}
+          >
+            <button
+              className="flex w-full items-center gap-1 rounded-lg px-1.5 py-1 text-left text-meta font-medium text-muted-foreground hover:bg-black/5 hover:text-foreground dark:hover:bg-white/5"
+              onClick={() => setUncategorizedExpanded((value) => !value)}
+            >
+              {uncategorizedExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+              <span className="min-w-0 flex-1 truncate">All chats</span>
+            </button>
+            {uncategorizedExpanded && sessionBuckets.map((bucket) => (
+              bucket.sessions.length > 0 ? (
+                <div key={bucket.key} data-testid={`session-bucket-${bucket.key}`} className="pt-2">
+                  <div className="px-2.5 pb-1 text-tiny font-medium text-muted-foreground/60 tracking-tight">
+                    {bucket.label}
+                  </div>
+                  {bucket.sessions.map(renderSession)}
                 </div>
-                {bucket.sessions.map((s) => {
-                  const agentId = getAgentIdFromSessionKey(s.key);
-                  const agentName = agentNameById[agentId] || agentId;
-                  return (
-                    <div key={s.key} className="group relative flex items-center">
-                      <button
-                        onClick={() => { switchSession(s.key); navigate('/'); }}
-                        className={cn(
-                          'w-full text-left rounded-lg px-2.5 py-1.5 text-meta transition-colors pr-7',
-                          'hover:bg-black/5 dark:hover:bg-white/5',
-                          isOnChat && currentSessionKey === s.key
-                            ? 'bg-black/5 dark:bg-white/10 text-foreground font-medium'
-                            : 'text-foreground/75',
-                        )}
-                      >
-                        <div className="flex min-w-0 items-center gap-2">
-                          <span className="shrink-0 rounded-full bg-black/[0.04] px-2 py-0.5 text-2xs font-medium text-foreground/70 dark:bg-white/[0.08]">
-                            {agentName}
-                          </span>
-                          <span className="truncate">{getSessionLabel(s.key, s.displayName, s.label)}</span>
-                        </div>
-                      </button>
-                      <button
-                        aria-label="Delete session"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSessionToDelete({
-                            key: s.key,
-                            label: getSessionLabel(s.key, s.displayName, s.label),
-                          });
-                        }}
-                        className={cn(
-                          'absolute right-1 flex items-center justify-center rounded p-0.5 transition-opacity',
-                          'opacity-0 group-hover:opacity-100',
-                          'text-muted-foreground hover:text-destructive hover:bg-destructive/10',
-                        )}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null
-          ))}
+              ) : null
+            ))}
+          </div>
         </div>
       )}
 
@@ -397,10 +625,26 @@ export function Sidebar() {
         onConfirm={async () => {
           if (!sessionToDelete) return;
           await deleteSession(sessionToDelete.key);
+          clearSessionFolder(sessionToDelete.key);
           if (currentSessionKey === sessionToDelete.key) navigate('/');
           setSessionToDelete(null);
         }}
         onCancel={() => setSessionToDelete(null)}
+      />
+
+      <ConfirmDialog
+        open={!!folderToDelete}
+        title={t('common:actions.confirm')}
+        message={`Delete folder "${folderToDelete?.name}"? Chats in this folder will move back to All chats.`}
+        confirmLabel={t('common:actions.delete')}
+        cancelLabel={t('common:actions.cancel')}
+        variant="destructive"
+        onConfirm={() => {
+          if (!folderToDelete) return;
+          deleteFolder(folderToDelete.id);
+          setFolderToDelete(null);
+        }}
+        onCancel={() => setFolderToDelete(null)}
       />
     </aside>
   );

@@ -1,15 +1,41 @@
-#!/usr/bin/env zx
+#!/usr/bin/env node
 
-import 'zx/globals';
 import { readFileSync, existsSync, mkdirSync, rmSync, cpSync, writeFileSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 const MANIFEST_PATH = join(ROOT, 'resources', 'skills', 'preinstalled-manifest.json');
 const OUTPUT_ROOT = join(ROOT, 'build', 'preinstalled-skills');
 const TMP_ROOT = join(ROOT, 'build', '.tmp-preinstalled-skills');
+
+function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd ?? ROOT,
+      stdio: options.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+      shell: false,
+      windowsHide: true,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    if (child.stdout) child.stdout.on('data', (chunk) => { stdout += chunk; });
+    if (child.stderr) child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      const rendered = [command, ...args].join(' ');
+      reject(new Error(`${rendered} failed with exit code ${code}${stderr ? `\n${stderr}` : ''}`));
+    });
+  });
+}
 
 function loadManifest() {
   if (!existsSync(MANIFEST_PATH)) {
@@ -61,22 +87,16 @@ function shouldCopySkillFile(srcPath) {
 }
 
 async function extractArchive(archiveFileName, cwd) {
-  const prevCwd = $.cwd;
-  $.cwd = cwd;
   try {
-    try {
-      await $`tar -xf ${archiveFileName}`;
+    await run('tar', ['-xf', archiveFileName], { cwd });
+    return;
+  } catch (tarError) {
+    if (process.platform === 'win32') {
+      // Some Windows images expose bsdtar instead of tar.
+      await run('bsdtar', ['-xf', archiveFileName], { cwd });
       return;
-    } catch (tarError) {
-      if (process.platform === 'win32') {
-        // Some Windows images expose bsdtar instead of tar.
-        await $`bsdtar -xf ${archiveFileName}`;
-        return;
-      }
-      throw tarError;
     }
-  } finally {
-    $.cwd = prevCwd;
+    throw tarError;
   }
 }
 
@@ -88,23 +108,23 @@ async function fetchSparseRepo(repo, ref, paths, checkoutDir) {
   const archivePath = join(checkoutDir, archiveFileName);
   const archivePaths = [...new Set(paths.map(normalizeRepoPath))];
 
-  await $`git init ${gitCheckoutDir}`;
-  await $`git -C ${gitCheckoutDir} remote add origin ${remote}`;
-  await $`git -C ${gitCheckoutDir} fetch --depth 1 origin ${ref}`;
+  await run('git', ['init', gitCheckoutDir]);
+  await run('git', ['-C', gitCheckoutDir, 'remote', 'add', 'origin', remote]);
+  await run('git', ['-C', gitCheckoutDir, 'fetch', '--depth', '1', 'origin', ref]);
   // Do not checkout working tree on Windows: upstream repos may contain
   // Windows-invalid paths. Export only requested directories via git archive.
-  await $`git -C ${gitCheckoutDir} archive --format=tar --output ${archiveFileName} FETCH_HEAD ${archivePaths}`;
+  await run('git', ['-C', gitCheckoutDir, 'archive', '--format=tar', '--output', archiveFileName, 'FETCH_HEAD', ...archivePaths]);
   await extractArchive(archiveFileName, checkoutDir);
   rmSync(archivePath, { force: true });
 
-  const commit = (await $`git -C ${gitCheckoutDir} rev-parse FETCH_HEAD`).stdout.trim();
+  const commit = (await run('git', ['-C', gitCheckoutDir, 'rev-parse', 'FETCH_HEAD'], { capture: true })).stdout.trim();
   return commit;
 }
 
-echo`Bundling preinstalled skills...`;
+console.log('Bundling preinstalled skills...');
 
 if (process.env.SKIP_PREINSTALLED_SKILLS === '1') {
-  echo`⏭  SKIP_PREINSTALLED_SKILLS=1 set, skipping skills fetch.`;
+  console.log('⏭  SKIP_PREINSTALLED_SKILLS=1 set, skipping skills fetch.');
   process.exit(0);
 }
 
@@ -125,9 +145,9 @@ for (const group of groups) {
   const repoDir = join(TMP_ROOT, createRepoDirName(group.repo, group.ref));
   const sparsePaths = [...new Set(group.entries.map((entry) => entry.repoPath))];
 
-  echo`Fetching ${group.repo} @ ${group.ref}`;
+  console.log(`Fetching ${group.repo} @ ${group.ref}`);
   const commit = await fetchSparseRepo(group.repo, group.ref, sparsePaths, repoDir);
-  echo`   commit ${commit}`;
+  console.log(`   commit ${commit}`);
 
   for (const entry of group.entries) {
     const sourceDir = join(repoDir, entry.repoPath);
@@ -158,10 +178,10 @@ for (const group of groups) {
       commit,
     });
 
-    echo`   OK ${entry.slug}`;
+    console.log(`   OK ${entry.slug}`);
   }
 }
 
 writeFileSync(join(OUTPUT_ROOT, '.preinstalled-lock.json'), `${JSON.stringify(lock, null, 2)}\n`, 'utf8');
 rmSync(TMP_ROOT, { recursive: true, force: true });
-echo`Preinstalled skills ready: ${OUTPUT_ROOT}`;
+console.log(`Preinstalled skills ready: ${OUTPUT_ROOT}`);
